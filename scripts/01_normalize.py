@@ -1,4 +1,13 @@
-"""数据标准化：post + comment → 统一 items.parquet，去除隐私字段。"""
+"""数据标准化（增量模式）。
+
+扫描 data/raw/ 下所有 search_contents_*.json 和 search_comments_*.json，
+只把 item_id 不在 items.parquet 中的新条目追加进去。
+
+用法：
+    python scripts/01_normalize.py          # 增量追加新数据
+    python scripts/01_normalize.py --full   # 忽略已有数据，从头全量重建
+"""
+import argparse
 import json
 from datetime import datetime
 from pathlib import Path
@@ -9,8 +18,6 @@ ROOT = Path(__file__).parent.parent
 RAW = ROOT / "data" / "raw"
 PROCESSED = ROOT / "data" / "processed"
 PROCESSED.mkdir(parents=True, exist_ok=True)
-
-PRIVACY_FIELDS = {"user_id", "nickname", "avatar", "xsec_token"}
 
 
 def parse_count(x) -> int:
@@ -34,8 +41,8 @@ def ts_to_str(ts) -> str | None:
         return None
 
 
-def load(filename):
-    with open(RAW / filename, encoding="utf-8") as f:
+def load_json(path: Path) -> list:
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -65,14 +72,11 @@ def normalize_posts(posts: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def normalize_comments(comments: list, post_df: pd.DataFrame) -> pd.DataFrame:
-    # 去重 post，每个 note_id 保留一条
-    post_lookup = post_df.drop_duplicates("note_id").set_index("note_id")
-
+def normalize_comments(comments: list, post_lookup: dict) -> pd.DataFrame:
     rows = []
     for c in comments:
         note_id = c.get("note_id", "")
-        parent = post_lookup.loc[note_id] if note_id in post_lookup.index else None
+        parent = post_lookup.get(note_id)
         rows.append({
             "item_id": f"comment:{c['comment_id']}",
             "source_type": "comment",
@@ -81,40 +85,85 @@ def normalize_comments(comments: list, post_df: pd.DataFrame) -> pd.DataFrame:
             "title": None,
             "text": str(c.get("content", "")).strip(),
             "raw_text": str(c.get("content", "")).strip(),
-            "source_keyword": parent["source_keyword"] if parent is not None else "",
+            "source_keyword": parent["source_keyword"] if parent else "",
             "tag_list": "",
             "like_count": parse_count(c.get("like_count")),
             "collect_count": 0,
             "comment_count": parse_count(c.get("sub_comment_count", 0)),
             "share_count": 0,
-            "note_url": parent["note_url"] if parent is not None else "",
+            "note_url": parent["note_url"] if parent else "",
             "created_at": ts_to_str(c.get("create_time")),
-            "parent_note_title": parent["title"] if parent is not None else None,
-            "parent_note_desc": parent["raw_text"] if parent is not None else None,
+            "parent_note_title": parent["title"] if parent else None,
+            "parent_note_desc": parent["raw_text"] if parent else None,
         })
     return pd.DataFrame(rows)
 
 
+def build_post_lookup(post_df: pd.DataFrame) -> dict:
+    """note_id → post row dict，每个 note_id 保留一条。"""
+    return (
+        post_df.drop_duplicates("note_id")
+               .set_index("note_id")
+               .to_dict("index")
+    )
+
+
 def main():
-    posts_raw = load("search_contents_2026-05-26.json")
-    comments_raw = load("search_comments_2026-05-26.json")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--full", action="store_true", help="全量重建，忽略已有数据")
+    args = parser.parse_args()
 
-    post_df = normalize_posts(posts_raw)
-    comment_df = normalize_comments(comments_raw, post_df)
+    # 加载已有 items（增量模式用）
+    existing_ids: set = set()
+    items_path = PROCESSED / "items.parquet"
+    if not args.full and items_path.exists():
+        existing_ids = set(pd.read_parquet(items_path, columns=["item_id"])["item_id"])
+        print(f"existing items: {len(existing_ids)}")
 
-    # 去重 post（同一 note_id 可能因不同 source_keyword 重复抓取）
-    post_df_dedup = post_df.drop_duplicates("note_id").reset_index(drop=True)
+    # 扫描所有 raw 文件
+    content_files = sorted(RAW.glob("search_contents_*.json"))
+    comment_files = sorted(RAW.glob("search_comments_*.json"))
+    print(f"raw files: {len(content_files)} content, {len(comment_files)} comment")
 
-    items_df = pd.concat([post_df_dedup, comment_df], ignore_index=True)
+    # 读取并合并所有 posts，按 note_id 去重
+    all_posts: list[dict] = []
+    for f in content_files:
+        all_posts.extend(load_json(f))
+    post_df_all = normalize_posts(all_posts).drop_duplicates("note_id")
+    post_lookup = build_post_lookup(post_df_all)
 
-    post_df.to_parquet(PROCESSED / "posts.parquet", index=False)
-    comment_df.to_parquet(PROCESSED / "comments.parquet", index=False)
-    items_df.to_parquet(PROCESSED / "items.parquet", index=False)
+    # 读取并合并所有 comments
+    all_comments: list[dict] = []
+    for f in comment_files:
+        all_comments.extend(load_json(f))
+    comment_df_all = normalize_comments(all_comments, post_lookup)
+    comment_df_all = comment_df_all.drop_duplicates("item_id")
 
-    print(f"posts.parquet:    {len(post_df)} rows  (dedup: {len(post_df_dedup)})")
-    print(f"comments.parquet: {len(comment_df)} rows")
-    print(f"items.parquet:    {len(items_df)} rows total")
-    print(f"saved to {PROCESSED}")
+    # 合并 items
+    items_all = pd.concat([post_df_all, comment_df_all], ignore_index=True)
+
+    # 只保留新 item_id
+    new_items = items_all[~items_all["item_id"].isin(existing_ids)]
+    print(f"new items to add: {len(new_items)}")
+
+    if len(new_items) == 0:
+        print("no new data, nothing to do.")
+        return
+
+    # 追加到已有 parquet（或新建）
+    if not args.full and items_path.exists():
+        existing_df = pd.read_parquet(items_path)
+        merged = pd.concat([existing_df, new_items], ignore_index=True)
+    else:
+        merged = items_all
+
+    merged.to_parquet(items_path, index=False)
+
+    # 同时更新 posts.parquet / comments.parquet（全量覆盖，方便查看）
+    post_df_all.to_parquet(PROCESSED / "posts.parquet", index=False)
+    comment_df_all.to_parquet(PROCESSED / "comments.parquet", index=False)
+
+    print(f"items.parquet: {len(merged)} rows total  (+{len(new_items)} new)")
 
 
 if __name__ == "__main__":

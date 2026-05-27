@@ -1,14 +1,18 @@
 """LLM 批量抽取：对 should_send_to_llm=True 的 item 做结构化抽取。
 
 用法：
-    python scripts/03_llm_extract.py            # 处理全部待抽取 item
-    python scripts/03_llm_extract.py --limit 20 # 只处理前 20 条（测试用）
-    python scripts/03_llm_extract.py --retry     # 只重跑上次 parse_failed 的
+    python scripts/03_llm_extract.py               # 全量，默认 10 并发
+    python scripts/03_llm_extract.py --limit 20    # 只跑前 20 条（测试）
+    python scripts/03_llm_extract.py --workers 5   # 调整并发数
+    python scripts/03_llm_extract.py --retry       # 只重跑 parse_failed
 """
 import argparse
 import json
 import os
+import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -23,12 +27,20 @@ PROCESSED = ROOT / "data" / "processed"
 PROMPT_FILE = ROOT / "prompts" / "extract_item_v1.txt"
 OUT_JSONL = PROCESSED / "extracted_items.jsonl"
 
-client = OpenAI(
-    api_key=os.environ["MINIMAX_API_KEY"],
-    base_url=os.environ["MINIMAX_BASE_URL"],
-)
 MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
 SYSTEM_PROMPT = PROMPT_FILE.read_text(encoding="utf-8")
+
+# 每个线程独立 client，避免连接争用
+_local = threading.local()
+
+
+def get_client() -> OpenAI:
+    if not hasattr(_local, "client"):
+        _local.client = OpenAI(
+            api_key=os.environ["MINIMAX_API_KEY"],
+            base_url=os.environ["MINIMAX_BASE_URL"],
+        )
+    return _local.client
 
 
 def build_user_message(row: dict) -> str:
@@ -37,8 +49,7 @@ def build_user_message(row: dict) -> str:
         if row.get("parent_note_title"):
             parts.append(f"【所属帖子标题】{row['parent_note_title']}")
         if row.get("parent_note_desc"):
-            desc = str(row["parent_note_desc"])[:300]
-            parts.append(f"【所属帖子简介】{desc}")
+            parts.append(f"【所属帖子简介】{str(row['parent_note_desc'])[:300]}")
     if row.get("title"):
         parts.append(f"【标题】{row['title']}")
     parts.append(f"【正文】{row['text']}")
@@ -50,12 +61,8 @@ def build_user_message(row: dict) -> str:
     return "\n".join(parts)
 
 
-import re as _re
-
-
 def _strip_response(raw: str) -> str:
-    """去掉 <think>...</think> 推理块和 markdown 代码块，只留 JSON。"""
-    raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -64,8 +71,8 @@ def _strip_response(raw: str) -> str:
     return raw
 
 
-def call_llm(user_msg: str, retries: int = 2) -> tuple[dict | None, bool]:
-    """返回 (parsed_dict, parse_failed)"""
+def call_llm(user_msg: str, retries: int = 4) -> tuple[dict | None, bool]:
+    client = get_client()
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
@@ -77,17 +84,30 @@ def call_llm(user_msg: str, retries: int = 2) -> tuple[dict | None, bool]:
                 temperature=0.1,
                 max_tokens=800,
             )
-            raw = resp.choices[0].message.content.strip()
-            raw = _strip_response(raw)
-            result = json.loads(raw)
-            return result, False
+            raw = _strip_response(resp.choices[0].message.content.strip())
+            return json.loads(raw), False
         except json.JSONDecodeError:
             if attempt < retries - 1:
-                time.sleep(1)
+                time.sleep(2)
         except Exception as e:
-            print(f"  API error: {e}")
-            time.sleep(2)
+            err = str(e)
+            if "429" in err or "rate_limit" in err:
+                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s
+                print(f"\n  rate limit, wait {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"\n  API error: {e}")
+                time.sleep(3)
     return None, True
+
+
+def process_row(row: dict) -> dict:
+    user_msg = build_user_message(row)
+    result, parse_failed = call_llm(user_msg)
+    record = {"item_id": row["item_id"], "parse_failed": parse_failed}
+    if result:
+        record.update(result)
+    return record
 
 
 def load_done_ids() -> set:
@@ -96,8 +116,7 @@ def load_done_ids() -> set:
         with open(OUT_JSONL, encoding="utf-8") as f:
             for line in f:
                 try:
-                    obj = json.loads(line)
-                    done.add(obj["item_id"])
+                    done.add(json.loads(line)["item_id"])
                 except Exception:
                     pass
     return done
@@ -106,12 +125,12 @@ def load_done_ids() -> set:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--retry", action="store_true", help="只重跑 parse_failed")
+    parser.add_argument("--workers", type=int, default=3)
+    parser.add_argument("--retry", action="store_true")
     args = parser.parse_args()
 
     df = pd.read_parquet(PROCESSED / "items.parquet")
     to_process = df[df["should_send_to_llm"] == True].copy()
-
     done_ids = load_done_ids()
 
     if args.retry:
@@ -134,30 +153,34 @@ def main():
     if args.limit:
         to_process = to_process.head(args.limit)
 
-    print(f"already done: {len(done_ids)}  |  to process: {len(to_process)}")
+    print(f"already done: {len(done_ids)}  |  to process: {len(to_process)}  |  workers: {args.workers}")
 
     PROCESSED.mkdir(parents=True, exist_ok=True)
+    write_lock = threading.Lock()
     success = failed = 0
+    counter_lock = threading.Lock()
+
+    rows = to_process.to_dict("records")
 
     with open(OUT_JSONL, "a", encoding="utf-8") as out:
-        for _, row in tqdm(to_process.iterrows(), total=len(to_process)):
-            user_msg = build_user_message(row.to_dict())
-            result, parse_failed = call_llm(user_msg)
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(process_row, row): row["item_id"] for row in rows}
+            with tqdm(total=len(futures)) as bar:
+                for fut in as_completed(futures):
+                    record = fut.result()
+                    with write_lock:
+                        out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        out.flush()
+                    with counter_lock:
+                        if record.get("parse_failed"):
+                            failed += 1
+                        else:
+                            success += 1
+                    bar.update(1)
+                    bar.set_postfix(ok=success, fail=failed)
 
-            record = {"item_id": row["item_id"], "parse_failed": parse_failed}
-            if result:
-                record.update(result)
-                success += 1
-            else:
-                failed += 1
+    print(f"\ndone. success={success}  failed={failed}")
 
-            out.write(json.dumps(record, ensure_ascii=False) + "\n")
-            out.flush()
-
-    print(f"\ndone. success={success} failed={failed}")
-    print(f"output → {OUT_JSONL}")
-
-    # 转 parquet
     records = []
     with open(OUT_JSONL, encoding="utf-8") as f:
         for line in f:

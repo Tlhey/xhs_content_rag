@@ -1,0 +1,1 @@
+985大二学生分享手搓的第一个AI Agent项目，使用Java+LangChain4j构建企业级智能Agent系统，围绕Java后端面试场景设计，集成了RAG、向量检索、Function Calling、Redis记忆管理、Prometheus监控等技术栈，可作为大学生写进简历的AI项目参考。

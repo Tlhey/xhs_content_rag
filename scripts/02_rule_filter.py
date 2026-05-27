@@ -83,8 +83,22 @@ def score_item(text: str) -> dict:
 def main():
     df = pd.read_parquet(PROCESSED / "items.parquet")
 
-    results = df["text"].fillna("").apply(score_item).apply(pd.Series)
-    df = pd.concat([df, results], axis=1)
+    # 只对还没打分的新条目处理（增量模式）
+    needs_score = ~df.columns.isin(["rule_score"]) or df.get("rule_score") is None
+    if "rule_score" in df.columns:
+        new_mask = df["rule_score"].isna()
+    else:
+        new_mask = pd.Series([True] * len(df), index=df.index)
+
+    new_count = new_mask.sum()
+    print(f"items to score: {new_count}  (already scored: {len(df) - new_count})")
+
+    if new_count == 0:
+        print("nothing to do.")
+        return
+
+    scored = df.loc[new_mask, "text"].fillna("").apply(score_item).apply(pd.Series)
+    df.loc[new_mask, scored.columns] = scored.values
 
     df.to_parquet(PROCESSED / "items.parquet", index=False)
 
