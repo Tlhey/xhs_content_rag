@@ -84,7 +84,6 @@ def main():
     df = pd.read_parquet(PROCESSED / "items.parquet")
 
     # 只对还没打分的新条目处理（增量模式）
-    needs_score = ~df.columns.isin(["rule_score"]) or df.get("rule_score") is None
     if "rule_score" in df.columns:
         new_mask = df["rule_score"].isna()
     else:
