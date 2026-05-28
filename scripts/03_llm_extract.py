@@ -27,7 +27,7 @@ PROCESSED = ROOT / "data" / "processed"
 PROMPT_FILE = ROOT / "prompts" / "extract_item_v1.txt"
 OUT_JSONL = PROCESSED / "extracted_items.jsonl"
 
-MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
+MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 SYSTEM_PROMPT = PROMPT_FILE.read_text(encoding="utf-8")
 
 # 每个线程独立 client，避免连接争用
@@ -37,8 +37,8 @@ _local = threading.local()
 def get_client() -> OpenAI:
     if not hasattr(_local, "client"):
         _local.client = OpenAI(
-            api_key=os.environ["MINIMAX_API_KEY"],
-            base_url=os.environ["MINIMAX_BASE_URL"],
+            api_key=os.environ["DEEPSEEK_API_KEY"],
+            base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         )
     return _local.client
 
